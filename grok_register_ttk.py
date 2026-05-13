@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Grok 注册机 - TTK GUI 版本
-整合 DrissionPage_example.py, openai_register.py, batch_open_nsfw.py
+整合 DrissionPage_example.py, openai_register.py
 """
 
 import tkinter as tk
@@ -14,7 +14,6 @@ import os
 import sys
 import queue
 import secrets
-import struct
 import random
 import re
 import string
@@ -37,7 +36,6 @@ DEFAULT_CONFIG = {
     "cloudflare_path_token": "/token",
     "cloudflare_path_messages": "/messages",
     "proxy": "http://127.0.0.1:7890",
-    "enable_nsfw": True,
     "register_count": 1,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
     "grok2api_auto_add_local": True,
@@ -46,6 +44,8 @@ DEFAULT_CONFIG = {
     "grok2api_auto_add_remote": False,
     "grok2api_remote_base": "",
     "grok2api_remote_app_key": "",
+    "register_threads": 1,
+    "thread_start_interval": 0.8,
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -1025,126 +1025,39 @@ def cloudflare_get_oai_code(
     raise Exception(f"Cloudflare 在 {timeout}s 内未收到验证码邮件")
 
 
-def generate_random_birthdate():
-    import datetime as dt
-
-    today = dt.date.today()
-    age = random.randint(20, 40)
-    birth_year = today.year - age
-    birth_month = random.randint(1, 12)
-    birth_day = random.randint(1, 28)
-    return f"{birth_year}-{birth_month:02d}-{birth_day:02d}T16:00:00.000Z"
-
-
-def set_birth_date(session, log_callback=None):
-    url = "https://grok.com/rest/auth/set-birth-date"
-    new_headers = {
-        "content-type": "application/json",
-        "origin": "https://grok.com",
-        "referer": "https://grok.com/",
-    }
-    payload = {"birthDate": generate_random_birthdate()}
-    try:
-        res = session.post(url, json=payload, headers=new_headers, timeout=15)
-        if log_callback:
-            log_callback(
-                f"[Debug] set_birth_date status: {res.status_code}, body: {res.text[:200]}"
-            )
-        return res.status_code == 200
-    except Exception as e:
-        if log_callback:
-            log_callback(f"[set_birth_date] 寮傚父: {e}")
-        return False
-
-
-def set_tos_accepted(session, log_callback=None):
-    url = "https://accounts.x.ai/auth_mgmt.AuthManagement/SetTosAcceptedVersion"
-    payload = struct.pack("B", (2 << 3) | 0) + struct.pack("B", 1)
-    data = b"\x00" + struct.pack(">I", len(payload)) + payload
-    new_headers = {
-        "content-type": "application/grpc-web+proto",
-        "x-grpc-web": "1",
-        "x-user-agent": "connect-es/2.1.1",
-        "origin": "https://accounts.x.ai",
-        "referer": "https://accounts.x.ai/accept-tos",
-    }
-    try:
-        res = session.post(url, data=data, headers=new_headers, timeout=15)
-        if log_callback:
-            log_callback(f"[Debug] set_tos_accepted status: {res.status_code}")
-        return res.status_code == 200
-    except Exception as e:
-        if log_callback:
-            log_callback(f"[set_tos_accepted] 寮傚父: {e}")
-        return False
-
-
-def encode_grpc_nsfw_settings():
-    field1_content = bytes([0x10, 0x01])
-    field1 = bytes([0x0A, len(field1_content)]) + field1_content
-    nsfw_string = b"always_show_nsfw_content"
-    field2_inner = bytes([0x0A, len(nsfw_string)]) + nsfw_string
-    field2 = bytes([0x12, len(field2_inner)]) + field2_inner
-    payload = field1 + field2
-    return b"\x00" + struct.pack(">I", len(payload)) + payload
-
-
-def update_nsfw_settings(session, log_callback=None):
-    url = "https://grok.com/auth_mgmt.AuthManagement/UpdateUserFeatureControls"
-    data = encode_grpc_nsfw_settings()
-    new_headers = {
-        "content-type": "application/grpc-web+proto",
-        "x-grpc-web": "1",
-        "origin": "https://grok.com",
-        "referer": "https://grok.com/",
-    }
-    try:
-        res = session.post(url, data=data, headers=new_headers, timeout=15)
-        if log_callback:
-            log_callback(f"[Debug] update_nsfw status: {res.status_code}")
-        return res.status_code == 200
-    except Exception as e:
-        if log_callback:
-            log_callback(f"[update_nsfw] 寮傚父: {e}")
-        return False
-
-
-def enable_nsfw_for_token(token, cf_clearance="", log_callback=None):
-    proxies = get_proxies()
-    user_agent = get_user_agent()
-    try:
-        with requests.Session(impersonate="chrome120", proxies=proxies) as session:
-            session.headers.update(
-                {
-                    "user-agent": user_agent,
-                    "cookie": f"sso={token}; sso-rw={token}; cf_clearance={cf_clearance}",
-                }
-            )
-            if not set_tos_accepted(session, log_callback):
-                return False, "set_tos_accepted 澶辫触!"
-            if not set_birth_date(session, log_callback):
-                return False, "set_birth_date 澶辫触!"
-            if not update_nsfw_settings(session, log_callback):
-                return False, "update_nsfw_settings 澶辫触!"
-            return True, "鎴愬姛寮€鍚疦SFW"
-    except Exception as e:
-        return False, f"寮傚父: {str(e)}"
-
-
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
 
-browser = None
-page = None
+_thread_ctx = threading.local()
+_browser_launch_semaphore = threading.Semaphore(2)
+
+
+def _get_browser():
+    return getattr(_thread_ctx, "browser", None)
+
+
+def _set_browser(value):
+    _thread_ctx.browser = value
+
+
+def _get_page():
+    return getattr(_thread_ctx, "page", None)
+
+
+def _set_page(value):
+    _thread_ctx.page = value
 
 
 def start_browser(log_callback=None):
-    global browser, page
     last_exc = None
     for attempt in range(1, 5):
         try:
-            browser = Chromium(create_browser_options())
-            tabs = browser.get_tabs()
-            page = tabs[-1] if tabs else browser.new_tab()
+            # 高并发下限制同时启动浏览器数量，降低 auto_port/user_data 竞争
+            with _browser_launch_semaphore:
+                browser = Chromium(create_browser_options())
+                tabs = browser.get_tabs()
+                page = tabs[-1] if tabs else browser.new_tab()
+            _set_browser(browser)
+            _set_page(page)
             if log_callback and getattr(browser, "user_data_path", None):
                 log_callback(f"[Debug] 当前浏览器资料目录: {browser.user_data_path}")
             if log_callback and attempt > 1:
@@ -1155,25 +1068,26 @@ def start_browser(log_callback=None):
             if log_callback:
                 log_callback(f"[Debug] 浏览器启动失败(第{attempt}/4次): {exc}")
             try:
-                if browser is not None:
-                    browser.quit(del_data=True)
+                current = _get_browser()
+                if current is not None:
+                    current.quit(del_data=True)
             except Exception:
                 pass
-            browser = None
-            page = None
+            _set_browser(None)
+            _set_page(None)
             time.sleep(min(1.5 * attempt, 4))
     raise Exception(f"浏览器启动失败，已重试4次: {last_exc}")
 
 
 def stop_browser():
-    global browser, page
+    browser = _get_browser()
     if browser is not None:
         try:
             browser.quit(del_data=True)
         except Exception:
             pass
-    browser = None
-    page = None
+    _set_browser(None)
+    _set_page(None)
 
 
 def restart_browser(log_callback=None):
@@ -1182,22 +1096,23 @@ def restart_browser(log_callback=None):
 
 
 def refresh_active_page():
-    global browser, page
+    browser = _get_browser()
     if browser is None:
-        restart_browser()
+        browser, _ = restart_browser()
     try:
         tabs = browser.get_tabs()
         if tabs:
             page = tabs[-1]
         else:
             page = browser.new_tab()
+        _set_page(page)
     except Exception:
-        restart_browser()
-    return page
+        _, page = restart_browser()
+    return _get_page()
 
 
 def click_email_signup_button(timeout=10, log_callback=None, cancel_callback=None):
-    global page
+    page = _get_page()
     deadline = time.time() + timeout
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -1243,25 +1158,29 @@ return true;
 
 
 def open_signup_page(log_callback=None, cancel_callback=None):
-    global browser, page
+    browser = _get_browser()
+    page = _get_page()
     raise_if_cancelled(cancel_callback)
     if browser is None:
-        start_browser()
+        browser, page = start_browser()
         if log_callback:
             log_callback("[*] 浏览器已启动")
     try:
         page = browser.get_tab(0)
+        _set_page(page)
         page.get(SIGNUP_URL)
     except Exception as e:
         if log_callback:
             log_callback(f"[Debug] 打开URL异常: {e}")
         try:
             page = browser.new_tab(SIGNUP_URL)
+            _set_page(page)
         except Exception as e2:
             if log_callback:
                 log_callback(f"[Debug] 创建新标签页异常: {e2}")
-            restart_browser()
+            browser, _ = restart_browser()
             page = browser.new_tab(SIGNUP_URL)
+            _set_page(page)
     page.wait.doc_loaded()
     sleep_with_cancel(2, cancel_callback)
     if log_callback:
@@ -1272,7 +1191,7 @@ def open_signup_page(log_callback=None, cancel_callback=None):
 
 
 def has_profile_form(log_callback=None):
-    refresh_active_page()
+    page = refresh_active_page()
     try:
         return bool(
             page.run_js(
@@ -1289,6 +1208,7 @@ return !!(givenInput && familyInput && passwordInput);
 
 
 def fill_email_and_submit(timeout=15, log_callback=None, cancel_callback=None):
+    page = _get_page()
     raise_if_cancelled(cancel_callback)
     email, dev_token = get_email_and_token()
     if not email or not dev_token:
@@ -1370,6 +1290,7 @@ return true;
 
 
 def fill_code_and_submit(email, dev_token, timeout=180, log_callback=None, cancel_callback=None):
+    page = _get_page()
     def _resend_code():
         page.run_js(
             r"""
@@ -1512,7 +1433,7 @@ return 'clicked';
 
 
 def getTurnstileToken(log_callback=None, cancel_callback=None):
-    global page
+    page = _get_page()
     if page is None:
         raise Exception("页面未就绪，无法执行 Turnstile")
 
@@ -1617,6 +1538,7 @@ def build_profile():
 
 
 def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None):
+    page = _get_page()
     given_name, family_name, password = build_profile()
     deadline = time.time() + timeout
     form_filled_once = False
@@ -1842,6 +1764,7 @@ def wait_for_sso_cookie(timeout=120, log_callback=None, cancel_callback=None):
         raise_if_cancelled(cancel_callback)
         try:
             refresh_active_page()
+            page = _get_page()
             if page is None:
                 sleep_with_cancel(1, cancel_callback)
                 continue
@@ -1961,6 +1884,8 @@ class GrokRegisterGUI:
         self.stop_requested = False
         self.ui_queue = queue.Queue()
         self.accounts_output_file = ""
+        self.stats_lock = threading.Lock()
+        self._tutorial_window = None
         self.setup_ui()
 
     def setup_ui(self):
@@ -1977,9 +1902,10 @@ class GrokRegisterGUI:
         self.count_var = tk.StringVar(value=str(config.get("register_count", 1)))
         self.count_spinbox = ttk.Spinbox(config_frame, from_=1, to=100, width=8, textvariable=self.count_var)
         self.count_spinbox.grid(row=0, column=3, sticky=tk.W, padx=5)
-        self.nsfw_var = tk.BooleanVar(value=config.get("enable_nsfw", True))
-        self.nsfw_check = ttk.Checkbutton(config_frame, text="注册后开启 NSFW", variable=self.nsfw_var)
-        self.nsfw_check.grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=5)
+        ttk.Label(config_frame, text="并发线程:").grid(row=1, column=2, sticky=tk.W, padx=10)
+        self.thread_var = tk.StringVar(value=str(config.get("register_threads", 1)))
+        self.thread_spinbox = ttk.Spinbox(config_frame, from_=1, to=10, width=8, textvariable=self.thread_var)
+        self.thread_spinbox.grid(row=1, column=3, sticky=tk.W, padx=5)
         ttk.Label(config_frame, text="代理（可选）:").grid(row=2, column=0, sticky=tk.W)
         self.proxy_var = tk.StringVar(value=config.get("proxy", ""))
         self.proxy_entry = ttk.Entry(config_frame, textvariable=self.proxy_var, width=30)
@@ -2055,6 +1981,10 @@ class GrokRegisterGUI:
         self.grok2api_remote_key_var = tk.StringVar(value=str(config.get("grok2api_remote_app_key", "")))
         self.grok2api_remote_key_entry = ttk.Entry(config_frame, textvariable=self.grok2api_remote_key_var, width=30)
         self.grok2api_remote_key_entry.grid(row=13, column=1, columnspan=3, sticky=tk.W, padx=5)
+        ttk.Label(config_frame, text="默认域名(defaultDomains):").grid(row=14, column=0, sticky=tk.W)
+        self.default_domains_var = tk.StringVar(value=str(config.get("defaultDomains", "")))
+        self.default_domains_entry = ttk.Entry(config_frame, textvariable=self.default_domains_var, width=30)
+        self.default_domains_entry.grid(row=14, column=1, columnspan=3, sticky=tk.W, padx=5)
         btn_frame = ttk.Frame(main_frame)
         btn_frame.pack(fill=tk.X, pady=10)
         self.start_btn = ttk.Button(btn_frame, text="开始注册", command=self.start_registration)
@@ -2078,8 +2008,12 @@ class GrokRegisterGUI:
 
     def log(self, message):
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        # 仅当用户当前就在底部时自动跟随，避免手动上滑后被强制拉回底部
+        yview = self.log_text.yview()
+        at_bottom = bool(yview) and yview[1] >= 0.999
         self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
-        self.log_text.see(tk.END)
+        if at_bottom:
+            self.log_text.see(tk.END)
 
     def clear_log(self):
         self.log_text.delete(1.0, tk.END)
@@ -2093,6 +2027,130 @@ class GrokRegisterGUI:
         self.stop_btn.config(state=tk.NORMAL if running else tk.DISABLED)
         self.status_var.set("运行中..." if running else "就绪")
         self.status_label.config(foreground="blue" if running else "green")
+
+    def _maybe_show_tutorial_on_start(self):
+        if bool(config.get("show_tutorial_on_start", True)):
+            self.show_tutorial()
+
+    def _tutorial_text(self):
+        return """欢迎使用 Grok 注册机。建议按下面顺序填写（从最关键到可选）：
+
+【第一步：先确定邮箱后端信息从哪里来】
+如果你使用 cloudflare 模式（你当前主要是这套），先去你的临时邮箱服务配置接口查信息：
+- 常见接口: /open_api/settings、/api/settings、/health_check
+- 重点字段:
+  - api_base（对应本工具的 Cloudflare API Base）
+  - domains / defaultDomains（可用域名）
+  - needAuth（是否需要鉴权）
+  - admin_password 或 api_key（需要鉴权时使用）
+  - provider.type（应为 cloudflare_temp_email）
+
+【第二步：先填最小可运行配置】
+1) 邮箱服务商
+- duckmail: 需要 DuckMail API Key
+- yyds: 需要 YYDS API Key 或 JWT
+- cloudflare: 需要 Cloudflare API Base（推荐你当前使用）
+
+2) Cloudflare API Base（cloudflare 模式必填）
+- 示例: https://xxxx.pages.dev
+- 填写规则: 与 settings 接口中的 api_base 保持一致
+
+3) 默认域名(defaultDomains)
+- 填写你要优先使用的域名
+- 支持单域名或逗号分隔多域名轮换
+- 示例: a.com,b.com
+
+4) CF 路径(domains/accounts/token/messages)
+- 必须与后端真实路由一致
+- 常见新路径:
+  - /api/domains,/api/new_address,/api/token,/api/mails
+- 常见旧路径:
+  - /domains,/accounts,/token,/messages
+
+5) Cloudflare API Key / 鉴权模式
+- needAuth=false: 通常鉴权模式选 none，key 可留空
+- needAuth=true: 按后端要求填 key，并选择 bearer/x-api-key/query-key
+
+【第三步：并发与稳定性】
+6) 注册数量
+- 本次要注册的总账号数
+
+7) 并发线程
+- 建议先 3-6 稳定后再升到 10
+
+8) 代理（可选）
+- 不填=直连
+- 示例: http://127.0.0.1:7890
+- 代理不稳会影响验证码和注册稳定性
+
+【第四步：grok2api 入池（可选）】
+10) grok2api 本地自动入池
+- 开启后把成功 sso 自动写入本地池
+- 本地 token.json 填 grok2api 的 token.json 路径
+
+11) grok2api 池名
+- ssoBasic 或 ssoSuper
+
+12) grok2api 远端自动入池
+- 开启后调用远端管理接口自动加 token
+- 远端 Base 示例: https://xxx/admin/api
+- app_key 按远端服务配置填写
+
+【最后：快速自检】
+1) 先设置: 注册数量=1，并发线程=1
+2) 点开始后看日志是否出现：
+- 已创建邮箱: xxx@你的域名
+- Cloudflare 本轮邮件数量: ...
+- 从邮件中提取到验证码: ...
+3) 若第一步就失败，优先检查 API Base / CF 路径 / 鉴权模式
+
+提示:
+- 点“开始注册”会自动保存当前配置到 config.json。
+- 如果关闭了启动教程，可随时点主界面的“教程”按钮重新打开。"""
+
+    def show_tutorial(self):
+        if self._tutorial_window is not None and self._tutorial_window.winfo_exists():
+            self._tutorial_window.lift()
+            self._tutorial_window.focus_force()
+            return
+
+        win = tk.Toplevel(self.root)
+        self._tutorial_window = win
+        win.title("使用教程")
+        win.geometry("760x620")
+        win.minsize(680, 520)
+        win.transient(self.root)
+
+        frame = ttk.Frame(win, padding=10)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        txt = scrolledtext.ScrolledText(frame, wrap=tk.WORD, height=26)
+        txt.pack(fill=tk.BOTH, expand=True)
+        txt.insert("1.0", self._tutorial_text())
+        txt.config(state=tk.DISABLED)
+
+        footer = ttk.Frame(frame)
+        footer.pack(fill=tk.X, pady=(8, 0))
+
+        dont_show_var = tk.BooleanVar(value=not bool(config.get("show_tutorial_on_start", True)))
+        chk = ttk.Checkbutton(
+            footer,
+            text="以后不再自动显示本教程",
+            variable=dont_show_var,
+        )
+        chk.pack(side=tk.LEFT)
+
+        def on_close():
+            config["show_tutorial_on_start"] = not bool(dont_show_var.get())
+            save_config()
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        close_btn = ttk.Button(footer, text="关闭", command=on_close)
+        close_btn.pack(side=tk.RIGHT, padx=5)
+        win.protocol("WM_DELETE_WINDOW", on_close)
 
     def should_stop(self):
         return self.stop_requested or not self.is_running
@@ -2114,6 +2172,11 @@ class GrokRegisterGUI:
         config["grok2api_auto_add_remote"] = bool(self.grok2api_remote_auto_var.get())
         config["grok2api_remote_base"] = self.grok2api_remote_base_var.get().strip()
         config["grok2api_remote_app_key"] = self.grok2api_remote_key_var.get().strip()
+        config["defaultDomains"] = self.default_domains_var.get().strip()
+        try:
+            config["register_threads"] = max(1, min(10, int(self.thread_var.get())))
+        except Exception:
+            config["register_threads"] = 1
         raw_paths = [x.strip() for x in self.cloudflare_paths_var.get().split(",") if x.strip()]
         if len(raw_paths) >= 4:
             config["cloudflare_path_domains"] = raw_paths[0] if raw_paths[0].startswith("/") else ("/" + raw_paths[0])
@@ -2139,11 +2202,12 @@ class GrokRegisterGUI:
         )
         self.update_stats()
         self._set_running_ui(True)
-        self.log(f"[*] 配置已保存，开始执行。目标数量: {count}")
+        worker_count = max(1, min(config.get("register_threads", 1), count))
+        self.log(f"[*] 配置已保存，开始执行。目标数量: {count}，并发线程: {worker_count}")
         self.log(f"[*] 成功账号将实时保存到: {self.accounts_output_file}")
         threading.Thread(
             target=self.run_registration,
-            args=(count,),
+            args=(count, worker_count),
             daemon=True,
         ).start()
 
@@ -2151,99 +2215,109 @@ class GrokRegisterGUI:
         self.stop_requested = True
         self.log("[!] 用户停止注册")
 
-    def run_registration(self, count):
-        try:
-            start_browser(log_callback=self.log)
-            self.log("[*] 浏览器已启动")
-            for i in range(count):
-                if self.should_stop():
-                    break
-                self.log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
-                try:
-                    email = ""
-                    dev_token = ""
-                    code = ""
-                    mail_ok = False
-                    max_mail_retry = 3
-                    for mail_try in range(1, max_mail_retry + 1):
-                        self.log(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
-                        open_signup_page(
-                            log_callback=self.log, cancel_callback=self.should_stop
-                        )
-                        self.log("[*] 2. 创建邮箱并提交")
-                        email, dev_token = fill_email_and_submit(
-                            log_callback=self.log, cancel_callback=self.should_stop
-                        )
-                        self.log(f"[*] 邮箱: {email}")
-                        self.log(f"[Debug] 邮箱credential(jwt): {dev_token}")
-                        try:
-                            with open(
-                                os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
-                                "a",
-                                encoding="utf-8",
-                            ) as f:
-                                f.write(f"{email}\t{dev_token}\n")
-                        except Exception:
-                            pass
-                        self.log("[*] 3. 拉取验证码")
-                        try:
-                            code = fill_code_and_submit(
-                                email,
-                                dev_token,
-                                log_callback=self.log,
-                                cancel_callback=self.should_stop,
-                            )
-                            mail_ok = True
-                            break
-                        except Exception as mail_exc:
-                            msg = str(mail_exc)
-                            if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
-                                self.log(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
-                                restart_browser(log_callback=self.log)
-                                sleep_with_cancel(1, self.should_stop)
-                                continue
-                            raise
+    def _run_single_registration(self, idx, total, logf):
+        email = ""
+        dev_token = ""
+        code = ""
+        mail_ok = False
+        max_mail_retry = 3
+        for mail_try in range(1, max_mail_retry + 1):
+            logf(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
+            open_signup_page(log_callback=logf, cancel_callback=self.should_stop)
+            logf("[*] 2. 创建邮箱并提交")
+            email, dev_token = fill_email_and_submit(log_callback=logf, cancel_callback=self.should_stop)
+            logf(f"[*] 邮箱: {email}")
+            try:
+                with open(os.path.join(os.path.dirname(__file__), "mail_credentials.txt"), "a", encoding="utf-8") as f:
+                    f.write(f"{email}\t{dev_token}\n")
+            except Exception:
+                pass
+            logf("[*] 3. 拉取验证码")
+            try:
+                code = fill_code_and_submit(email, dev_token, log_callback=logf, cancel_callback=self.should_stop)
+                mail_ok = True
+                break
+            except Exception as mail_exc:
+                msg = str(mail_exc)
+                if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
+                    logf(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
+                    restart_browser(log_callback=logf)
+                    sleep_with_cancel(1, self.should_stop)
+                    continue
+                raise
+        if not mail_ok:
+            raise Exception("验证码阶段失败，已达到最大重试次数")
+        logf(f"[*] 验证码: {code}")
+        logf("[*] 4. 填写资料")
+        profile = fill_profile_and_submit(log_callback=logf, cancel_callback=self.should_stop)
+        logf(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
+        logf("[*] 5. 等待 sso cookie")
+        sso = wait_for_sso_cookie(log_callback=logf, cancel_callback=self.should_stop)
+        with self.stats_lock:
+            self.results.append({"email": email, "sso": sso, "profile": profile})
+            self.success_count += 1
+            line = f"{email}----{profile.get('password','')}----{sso}\n"
+            try:
+                with open(self.accounts_output_file, "a", encoding="utf-8") as f:
+                    f.write(line)
+            except Exception as file_exc:
+                logf(f"[Debug] 保存账号文件失败: {file_exc}")
+        add_token_to_grok2api_pools(sso, email=email, log_callback=logf)
+        logf(f"[+] 注册成功: {email}")
 
-                    if not mail_ok:
-                        raise Exception("验证码阶段失败，已达到最大重试次数")
-                    self.log(f"[*] 验证码: {code}")
-                    self.log("[*] 4. 填写资料")
-                    profile = fill_profile_and_submit(
-                        log_callback=self.log, cancel_callback=self.should_stop
-                    )
-                    self.log(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
-                    self.log("[*] 5. 等待 sso cookie")
-                    sso = wait_for_sso_cookie(
-                        log_callback=self.log, cancel_callback=self.should_stop
-                    )
-                    self.results.append({"email": email, "sso": sso, "profile": profile})
-                    try:
-                        line = f"{email}----{profile.get('password','')}----{sso}\n"
-                        with open(self.accounts_output_file, "a", encoding="utf-8") as f:
-                            f.write(line)
-                    except Exception as file_exc:
-                        self.log(f"[Debug] 保存账号文件失败: {file_exc}")
-                    add_token_to_grok2api_pools(sso, email=email, log_callback=self.log)
-                    self.success_count += 1
-                    self.log(f"[+] 注册成功: {email}")
+    def _worker_loop(self, worker_id, total, task_queue):
+        prefix = f"[T{worker_id}]"
+        logf = lambda m: self.log(f"{prefix} {m}")
+        try:
+            start_browser(log_callback=logf)
+            logf("[*] 浏览器已启动")
+            while not self.should_stop():
+                try:
+                    idx = task_queue.get_nowait()
+                except queue.Empty:
+                    break
+                logf(f"--- 开始第 {idx}/{total} 个账号 ---")
+                try:
+                    self._run_single_registration(idx, total, logf)
                 except RegistrationCancelled:
-                    self.log("[!] 注册被用户停止")
+                    logf("[!] 注册被用户停止")
                     break
                 except Exception as exc:
-                    self.fail_count += 1
-                    self.log(f"[-] 注册失败: {exc}")
+                    with self.stats_lock:
+                        self.fail_count += 1
+                    logf(f"[-] 注册失败: {exc}")
                 finally:
                     self.update_stats()
                     if self.should_stop():
                         break
-                    restart_browser(log_callback=self.log)
+                    restart_browser(log_callback=logf)
                     sleep_with_cancel(1, self.should_stop)
         except Exception as exc:
-            self.log(f"[!] 任务异常: {exc}")
+            logf(f"[!] 线程异常: {exc}")
         finally:
             stop_browser()
-            self._set_running_ui(False)
-            self.log("[*] 任务结束")
+
+    def run_registration(self, count, worker_count):
+        task_queue = queue.Queue()
+        for i in range(1, count + 1):
+            task_queue.put(i)
+        workers = []
+        try:
+            start_interval = float(config.get("thread_start_interval", 0.8))
+        except Exception:
+            start_interval = 0.8
+        if start_interval < 0:
+            start_interval = 0.0
+        for wid in range(1, worker_count + 1):
+            t = threading.Thread(target=self._worker_loop, args=(wid, count, task_queue), daemon=True)
+            workers.append(t)
+            t.start()
+            if wid < worker_count and start_interval > 0:
+                sleep_with_cancel(start_interval, self.should_stop)
+        for t in workers:
+            t.join()
+        self._set_running_ui(False)
+        self.log("[*] 任务结束")
 
 def main():
     root = tk.Tk()
